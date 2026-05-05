@@ -1,0 +1,13 @@
+{
+    "display_name": "Side Skit 角色小剧场",
+    "loading_order": 101,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "version": "1.0.0",
+    "author": "for sweetheart",
+    "homePage": "",
+    "auto_update": true,
+    "js": "index.js",
+    "css": "style.css"
+}
