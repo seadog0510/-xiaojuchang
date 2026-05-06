@@ -52,51 +52,73 @@ function extractCharacters() {
 
     const settings = getSettings();
 
-    // 用户手动指定优先
+    // 用户手动指定优先（最可靠，强烈建议宝宝直接填）
     if (settings.customCharacters?.trim()) {
-        return settings.customCharacters.split(/[,，、]/).map(s => s.trim()).filter(Boolean);
+        return settings.customCharacters.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean);
     }
 
     const charId = ctx.characterId;
     const char = (ctx.characters || [])[charId];
-    const mainName = ctx.name2 || char?.name || 'Char';
-    const userName = ctx.name1 || 'User';
+    const mainName = (ctx.name2 || char?.name || 'Char').trim();
+    const userName = (ctx.name1 || 'User').trim();
 
     if (!char) return [];
 
-    // 来源 1：角色卡静态字段
-    const cardText = [
-        char.description || '',
-        char.personality || '',
-        char.scenario || '',
-        char.first_mes || '',
-    ].join('\n');
-
-    // 来源 2：最近聊天历史（最有效，因为对话里直接出现 @xxx 和 xxx："..."）
+    // ⚠ 关键：不再扫 description / personality / scenario / first_mes
+    // 那些字段里全是写作指令、小标题、结构性词，扫了全是噪声
+    // 只扫两个相对干净的来源：
+    //   1. mes_example（对话示例，里面才会有真实角色名）
+    //   2. 最近的聊天历史（最高置信度）
+    const exampleText = char.mes_example || '';
     const recentChat = (ctx.chat || []).slice(-30).map(m => m.mes || '').join('\n');
 
-    const allText = cardText + '\n' + recentChat;
+    const allText = exampleText + '\n' + recentChat;
 
-    // 高置信度模式：直接抓"@xxx" 和 "xxx：" 这种明显说话人标记
-    const highConfidence = new Set();
-    // @某某  或 @某某 后跟空格/标点
-    (allText.match(/@([\u4e00-\u9fa5A-Za-z0-9]{1,8})/g) || []).forEach(m => {
-        const name = m.slice(1).trim();
-        if (name && name !== mainName && name !== userName) highConfidence.add(name);
+    // 主角名排除集（包括粘连形式）
+    const excludes = new Set([
+        mainName, userName,
+        '是' + mainName, '小' + mainName, '老' + mainName,
+    ]);
+
+    const found = new Set();
+
+    // —— 信号 1：高置信度 - "@xxx" 直接 at ——
+    (allText.match(/@([\u4e00-\u9fa5]{2,4})(?![\u4e00-\u9fa5])/g) || []).forEach(m => {
+        const name = m.slice(1);
+        if (!excludes.has(name)) found.add(name);
     });
-    // 行首：xxx："..."  或  xxx说："..."
-    (allText.match(/(?:^|\n|。|！|？)\s*([\u4e00-\u9fa5]{2,4})[:：]/g) || []).forEach(m => {
-        const name = m.replace(/[\s。！？\n:：]/g, '');
-        if (name && name !== mainName && name !== userName) highConfidence.add(name);
+
+    // —— 信号 2：高置信度 - 行首"xxx：" 说话人冒号 ——
+    (allText.match(/(?:^|\n)\s*([\u4e00-\u9fa5]{2,4})\s*[:：]/g) || []).forEach(m => {
+        const name = m.replace(/[\s\n:：]/g, '');
+        if (!excludes.has(name)) found.add(name);
     });
 
-    const found = new Set(highConfidence);
+    // —— 信号 3：中等置信度 - "xxx说/xxx问/xxx点头" 这种动作模式 ——
+    const verbs = '说道|说|问|答|笑|应|嘀咕|嘟囔|哼|叹|喊|低声|开口|回答|点头|摇头|抬头|皱眉|翻白眼';
+    const verbRegex = new RegExp(`([\\u4e00-\\u9fa5]{2,4})(?:${verbs})`, 'g');
+    let match;
+    while ((match = verbRegex.exec(allText)) !== null) {
+        const name = match[1];
+        if (excludes.has(name)) continue;
+        // 必须出现 ≥ 2 次才认
+        const count = (allText.match(new RegExp(name, 'g')) || []).length;
+        if (count >= 2) found.add(name);
+    }
 
-    // 中文姓名（频率 ≥ 2 次）
-    const chineseNames = allText.match(/[\u4e00-\u9fa5]{2,4}/g) || [];
-    const cnFreq = {};
-    chineseNames.forEach(n => { cnFreq[n] = (cnFreq[n] || 0) + 1; });
-    const cnNonNames = new Set([
+    // —— 黑名单过滤 ——
+    // 结构性词（角色卡 description 里常见的小标题/结构词）
+    const structuralBlacklist = new Set([
+        '判断方法','会出现','借钱流程','互怼烈度','硬边界','简单说',
+        '具体反应','具体话术','行为切片','触发条件','默认状态',
+        '陪玩营业','群聊存在','聊天风格','硬性原则','写作铁律',
+        '钢铁直男','一线城市','宿舍楼下','小卖部','便利店',
+        '某个契机','某次语音',
+        '完全不','不完全','绝对不','绝大多数','大部分','可能会',
+        '比如说','例如说','语气词','表情包','朋友圈','小作文',
+    ]);
+    // 通用代词/助词
+    const commonBlacklist = new Set([
         '这个','那个','什么','怎么','为什么','可能','已经','一直','突然',
         '现在','时候','感觉','觉得','知道','看到','听到','说话','没有',
         '所以','但是','不过','然后','因为','如果','虽然','只是','还有',
@@ -106,35 +128,27 @@ function extractCharacters() {
         '一个','两个','几个','每个','所有','全部','一切','任何','某个',
         '今天','明天','昨天','早上','中午','晚上','下午','上午','以后','以前',
         '声音','眼睛','头发','手指','身体','脸色','表情','心里','脑海',
-        '不会','不能','不要','不是','不过','不行','不用','不可','不会',
+        '不会','不能','不要','不是','不行','不用','不可',
+        '凌晨','深夜','清晨','傍晚','周末','分钟','小时',
+        '老板','姐姐','哥哥','弟弟','妹妹','叔叔','阿姨','同学','同事',
+        '朋友','兄弟','哥们','姐妹','室友','队友','所有人',
     ]);
-    Object.entries(cnFreq).forEach(([n, freq]) => {
-        if (freq < 2) return;
-        if (n === mainName || n === userName) return;
-        if (cnNonNames.has(n)) return;
-        // 中文名通常不是纯重复字（"哈哈"、"好好"）
-        if (/^(.)\1+$/.test(n)) return;
-        found.add(n);
-    });
 
-    // 英文名（频率 ≥ 2 次，避开字体名/UI 词）
-    const enNames = cardText.match(/\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?\b/g) || [];
-    const enFreq = {};
-    enNames.forEach(n => { enFreq[n] = (enFreq[n] || 0) + 1; });
-    const enNonNames = new Set([
-        'The','And','But','You','She','He','They','When','Where','Why','How',
-        'This','That','These','Those','There','Here','After','Before','During',
-        'Cormorant','Garamond','Times','New','Roman','Arial','Helvetica','Verdana',
-        'Georgia','Courier','Tahoma','Trebuchet','Calibri','Cambria','Consolas',
-        'Unapproachable','OOC','POV',
-    ]);
-    Object.entries(enFreq).forEach(([n, freq]) => {
-        if (freq < 2) return;  // 至少出现 2 次才算
-        if (n === mainName || n === userName) return;
-        // 任一单词是字体/UI 黑名单的整名都丢弃
-        if (n.split(/\s+/).some(w => enNonNames.has(w))) return;
-        found.add(n);
-    });
+    for (const name of [...found]) {
+        if (structuralBlacklist.has(name) || commonBlacklist.has(name)) {
+            found.delete(name);
+            continue;
+        }
+        // 主角名作为子串（"是程御宸"这种）
+        if (mainName.length >= 2 && (name.includes(mainName) || mainName.includes(name))) {
+            found.delete(name);
+            continue;
+        }
+        // 纯重复字（"哈哈"）
+        if (/^(.)\1+$/.test(name)) {
+            found.delete(name);
+        }
+    }
 
     return Array.from(found).slice(0, 8);
 }
@@ -201,8 +215,14 @@ async function aiSkit() {
 
     const settings = getSettings();
     const chars = state.characters;
+
+    // 没有任何次要角色时，直接放弃 AI 调用，否则会发瞎 prompt 让 AI 空回
     if (chars.length === 0) {
-        addBubble(localSkit());
+        addBubble({
+            speaker: '系统',
+            text: '没识别到次要角色，没法调 AI。建议：点 ⚙ 在「手动指定角色」里直接填上发小名字（用逗号分隔）',
+            isLocal: true,
+        });
         return;
     }
 
@@ -217,33 +237,39 @@ async function aiSkit() {
     const charList = chars.join('、');
     const charName = ctx.name2 || '主角';
 
-    // 取最近一两句聊天作为氛围参考（不取太多防污染）
-    const recentMsgs = (ctx.chat || []).slice(-2)
-        .map(m => (m.mes || '').slice(0, 200))
-        .filter(Boolean)
-        .join('\n');
+    // 不再附加聊天历史 —— 主对话语境太重，污染严重
+    // 让 AI 完全基于角色名生成，反而更稳
 
-    const systemPrompt = `你是一个小剧场生成器。你的任务是为用户的角色扮演生成一段简短的"番外小剧场"。
-当前主角是 ${charName}，次要角色有：${charList}。
-${recentMsgs ? `当前剧情氛围参考：\n${recentMsgs}\n` : ''}
-要求：
-1. 从次要角色中选 1-2 个（不要选主角 ${charName}）
-2. 让他们说一两句话或做一个小动作，要有日常感、可以是吐槽/闲聊/小八卦
-3. 长度控制在 30-80 字之内，简短有趣
-4. 直接输出小剧场内容，不要任何前缀、解释、OOC 标记、思考过程
-5. 格式：角色名："对话内容"  或  角色名 动作描写。`;
+    // 强制句式 prompt，减少 AI 拒绝/空回的可能
+    const systemPrompt = `你现在的任务是写一段"角色番外小剧场"，与主线剧情无关。
 
-    const userPrompt = `请生成一段小剧场，从 ${charList} 中选 1-2 人。直接输出，不要解释。`;
+主角：${charName}（不要在小剧场里出现）
+次要角色（必须只用这些）：${charList}
+
+写作规范：
+- 从次要角色里选 1-2 个出场
+- 让他们简短说一两句对话或做个小动作
+- 总长度 30-60 字
+- 风格要日常、有趣、像哥们间的吐槽闲聊
+- 格式严格按：「角色名："对话内容"」 或 「角色名 在做什么」
+
+绝对不要：
+- 让主角 ${charName} 出现
+- 输出"我来写"、"好的"、"以下是"这种前缀
+- 输出 OOC、解释、思考标签
+- 写超过 60 字`;
+
+    const userPrompt = `开始写。直接输出小剧场内容，不要任何前后文。`;
 
     let result = null;
     let lastError = null;
 
-    // 优先用 generateRaw（绕开预设污染），不行就退回 quietPrompt
+    // 优先用 generateRaw（绕开预设污染）
     const tryRaw = async () => {
         if (!ctx.generateRaw) return null;
+        // 关键：systemPrompt 通过 systemPrompt 参数传，不要重复塞进 prompt 数组
         return await ctx.generateRaw({
             prompt: [
-                { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt },
             ],
             systemPrompt: systemPrompt,
@@ -253,11 +279,12 @@ ${recentMsgs ? `当前剧情氛围参考：\n${recentMsgs}\n` : ''}
 
     const tryQuiet = async () => {
         if (!ctx.generateQuietPrompt) return null;
-        const fullPrompt = `[小剧场任务] ${systemPrompt}\n\n${userPrompt}`;
+        // quietPrompt 没有独立 system 字段，把规则全合进去
+        const fullPrompt = `${systemPrompt}\n\n${userPrompt}`;
         return await ctx.generateQuietPrompt({
             quietPrompt: fullPrompt,
             quietToLoud: false,
-            skipWIAN: true,  // 跳过 WI 注入避免污染
+            skipWIAN: true,
             quietImage: null,
             quietName: 'SideSkit',
             responseLength: settings.maxAITokens,
@@ -599,4 +626,3 @@ jQuery(async () => {
         console.error('[SideSkit] 启动失败:', e);
     }
 });
-
